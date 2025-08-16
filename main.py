@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-CryptoWatcherBot — نسخه پایدار نهایی
------------------------------------
-- هر ۵ دقیقه
-- ۱۵ ارز برتر
-- توکن و chat_id داخل کد
-- سازگار با python-telegram-bot نسخه‌های جدید (۲۱.x) و قدیمی‌تر (۱۳.x)
-"""
 
 import asyncio
 import logging
@@ -17,7 +9,7 @@ import requests
 from telegram.constants import ParseMode
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
-# --------------- تنظیمات و لاگینگ ---------------
+# تنظیمات
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -29,12 +21,11 @@ DEFAULT_CHAT_ID = "821239377"
 PUSH_EVERY_MIN = 5
 MANUAL_TOMAN_RATE = 0
 
-# --------------- دریافت داده‌ها ---------------
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
 FX_URL = "https://api.exchangerate.host/latest?base=USD&symbols=IRR"
 HEADERS = {"User-Agent": "CryptoWatcherBot/1.0"}
 
-
+# گرفتن داده‌ها
 def fetch_top() -> List[Dict]:
     params = {
         "vs_currency": "usd",
@@ -58,7 +49,6 @@ def fetch_top() -> List[Dict]:
         )
     return neat
 
-
 def fetch_usd_to_toman() -> float:
     if MANUAL_TOMAN_RATE > 0:
         return MANUAL_TOMAN_RATE
@@ -70,11 +60,9 @@ def fetch_usd_to_toman() -> float:
         raise RuntimeError("Invalid IRR rate")
     return irr / 10.0
 
-
-# --------------- فرمت خروجی ---------------
+# فرمت‌بندی
 def fmt_num(n: float, digits: int = 2) -> str:
     return f"{n:,.{digits}f}".replace(",", "_").replace("_", ",")
-
 
 def render_message(rows: List[Dict], usd_to_toman: float) -> str:
     lines = []
@@ -95,8 +83,7 @@ def render_message(rows: List[Dict], usd_to_toman: float) -> str:
     lines.append("\nData: CoinGecko • FX: exchangerate.host")
     return "\n".join(lines)
 
-
-# --------------- هندلرهای بات ---------------
+# هندلرها
 async def now(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         rows = fetch_top()
@@ -107,7 +94,6 @@ async def now(update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("/now failed")
         await update.message.reply_text(f"خطا: {e}")
 
-
 async def _send_once(app: Application, chat_id: int) -> None:
     try:
         rows = fetch_top()
@@ -117,46 +103,19 @@ async def _send_once(app: Application, chat_id: int) -> None:
     except Exception as e:
         logger.exception("push failed")
 
-
 async def periodic_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     app: Application = context.application
     if DEFAULT_CHAT_ID and DEFAULT_CHAT_ID.isdigit():
         await _send_once(app, int(DEFAULT_CHAT_ID))
 
-
-# --------------- اجرای اصلی ---------------
-async def main_new() -> None:
+# اجرای اصلی
+async def main() -> None:
     application: Application = ApplicationBuilder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("now", now))
+    application.job_queue.run_repeating(periodic_job, interval=PUSH_EVERY_MIN * 60, first=5)
 
-    job_queue = getattr(application, "job_queue", None)
-    if job_queue:
-        job_queue.run_repeating(periodic_job, interval=PUSH_EVERY_MIN * 60, first=5)
-
-    logger.info("Bot is running (new API).")
+    logger.info("Bot is running…")
     await application.run_polling()
 
-
-def main_old() -> None:
-    from telegram.ext import Updater
-
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler("now", now))
-
-    job_queue = updater.job_queue
-    job_queue.run_repeating(lambda ctx: asyncio.run(periodic_job(ctx)), interval=PUSH_EVERY_MIN * 60, first=5)
-
-    logger.info("Bot is running (old API).")
-    updater.start_polling()
-    updater.idle()
-
-
 if __name__ == "__main__":
-    try:
-        if asyncio.iscoroutinefunction(Application.run_polling):
-            asyncio.run(main_new())  # نسخه جدید
-        else:
-            main_old()  # نسخه قدیمی
-    except (KeyboardInterrupt, SystemExit):
-        print("Shutting down…")
+    asyncio.run(main())
