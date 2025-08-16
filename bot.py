@@ -1,82 +1,44 @@
 # -*- coding: utf-8 -*-
-# CineBot – نسخه کامل تک‌فایلی (Render-ready)
-# امکانات:
-#  - منوی فارسی: فیلم/سریال ایرانی و خارجی، آرشیو 3 روز، جستجو نام، جستجوی گسترده، تماس با من
-#  - منابع سریع و جستجوی گسترده (سایت‌های آزاد)
-#  - خروجی: نام، سال، کیفیت (حدسی از عنوان)، لینک
-#  - اسکرپینگ مقاوم با هدر مرورگر + تایم‌اوت + مدیریت خطا
-#  - وب‌سرور /health برای نگه داشتن سرویس در Render
-#  - بدون وابستگی قطعی به lxml (از html.parser استفاده می‌شود)
+# CineBot (Legal New Releases Notifier) – Filimo / Namava / Filmnet / SalamCinema / Cinematicket
+# Text-only (no image download). Outputs: title + year (+genre if text contains it) + official page link.
+# python-telegram-bot v13.x compatible. Flask keep-alive for Render. No lxml dependency.
 
-import os, re, time, threading, sqlite3, random
-from datetime import datetime, timedelta, timezone
-
+import os, re, time, threading, random, logging
+from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-)
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
-# -------- تنظیمات شما --------
+# ====== YOUR SETTINGS ======
 BOT_TOKEN     = "8153319362:AAGgeAOZyP2VgAdqvjyvvIkgGZBsJtTQOTs"
-ADMIN_CHAT_ID = "821239377"                # عددی
-CONTACT_USER  = "shahin_sehati"            # بدون @
-CHECK_INTERVAL_SECONDS = 900               # 15 دقیقه
-# ------------------------------
+ADMIN_CHAT_ID = 821239377
+CONTACT_USER  = "shahin_sehati"
+CHECK_INTERVAL_SECONDS = 900  # every 15 minutes
+# ===========================
 
-UA = "Mozilla/5.0 (Linux; Android 13; Render) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+log = logging.getLogger("CineBotLegal")
+
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
 HDR = {"User-Agent": UA, "Accept-Language": "fa,en;q=0.9"}
-REQ_TIMEOUT = 30
+REQ_TIMEOUT = 25
 
-DB_FILE = "cinebot_seen.db"
+# ---------- Helpers ----------
+def fetch(url):
+    try:
+        r = requests.get(url, headers=HDR, timeout=REQ_TIMEOUT)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:
+        log.warning(f"fetch error: {url} -> {e}")
+        return ""
 
-# منابع سریع (برای دکمه‌های اصلی)
-QUICK_SOURCES = [
-    ("hexdownload", "https://hexdownload.net/category/movie/", "movie"),
-    ("hexdownload", "https://hexdownload.net/category/series/", "series"),
-    ("uptvs",       "https://uptvs.com/category/movie", "movie"),
-    ("uptvs",       "https://uptvs.com/category/series", "series"),
-    ("film2movie",  "https://film2movie.asia/category/فیلم-ایرانی/", "movie"),
-    ("film2movie",  "https://film2movie.asia/category/سریال-ایرانی/", "series"),
-]
-
-# منابع جستجوی گسترده (همراه با سریع‌ها)
-EXTENDED_SOURCES = QUICK_SOURCES + [
-    ("digimoviez",  "https://digimoviez.net/", "all"),
-    ("my-film",     "https://my-film.in/", "all"),
-    ("golchindl",   "https://golchindl.me/", "all"),
-    ("bia2movies",  "https://bia2movies.bid/", "all"),
-    ("1film",       "https://1film.ir/", "all"),
-    ("par30dl",     "https://www.par30dl.com/cat/movie/", "movie"),
-    ("par30dl",     "https://www.par30dl.com/cat/series/", "series"),
-]
-
-QUALITY_HINTS = ["1080", "720", "480", "2160", "4K", "BluRay", "WEB-DL", "WEBRip", "HDRip", "x265", "HEVC", "Dual", "دوبله", "زیرنویس"]
-
-# ---------- پایگاه داده (ممانعت از ارسال تکراری) ----------
-def db_init():
-    con = sqlite3.connect(DB_FILE); cur = con.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS seen (url TEXT PRIMARY KEY, title TEXT, ts TEXT)")
-    con.commit(); con.close()
-
-def db_seen_has(url):
-    con = sqlite3.connect(DB_FILE); cur = con.cursor()
-    cur.execute("SELECT 1 FROM seen WHERE url=?", (url,))
-    ok = cur.fetchone() is not None
-    con.close(); return ok
-
-def db_seen_add(url, title):
-    con = sqlite3.connect(DB_FILE); cur = con.cursor()
-    cur.execute("INSERT OR IGNORE INTO seen(url,title,ts) VALUES (?,?,?)", (url, title, datetime.utcnow().isoformat()))
-    con.commit(); con.close()
-
-# ---------- کمک‌تابع‌ها ----------
 def abs_url(base, href):
     if not href: return ""
-    if href.startswith("http://") or href.startswith("https://"): return href
+    if href.startswith("http"): return href
     if href.startswith("//"): return "https:" + href
     if href.startswith("/"):
         m = re.match(r"(https?://[^/]+)", base)
@@ -84,352 +46,322 @@ def abs_url(base, href):
         return origin + href
     return base.rstrip("/") + "/" + href.lstrip("/")
 
-def guess_year(*texts):
-    for s in texts:
-        if not s: continue
-        m = re.search(r"(19|20)\d{2}", s)
-        if m: return m.group(0)
-    return "-"
+def guess_year(text):
+    if not text: return "-"
+    m = re.search(r"(19|20)\d{2}", text)
+    return m.group(0) if m else "-"
 
-def guess_quality(*texts):
-    bag = []
-    for s in texts:
-        if not s: continue
-        for q in QUALITY_HINTS:
-            if q.lower() in s.lower() and q not in bag:
-                bag.append(q)
-    return ", ".join(bag[:6]) if bag else "-"
+def maybe_genre(text):
+    if not text: return "-"
+    # very light heuristic
+    genres_fa = ["اکشن","ماجراجویی","انیمیشن","کمدی","جنایی","درام","فانتزی","تاریخی","ترسناک","معمایی","عاشقانه","علمی","ورزشی","جنگی","خانوادگی","مستند"]
+    found = [g for g in genres_fa if g in text]
+    return "، ".join(found) if found else "-"
 
-def is_fa(title):
-    return bool(re.search(r"[\u0600-\u06FF]", title or ""))
+def split_blocks(lines, max_len=3500, per_msg=6):
+    out, buf = [], []
+    for i, block in enumerate(lines, 1):
+        buf.append(block)
+        if len("\n\n".join(buf)) > max_len or (i % per_msg == 0):
+            out.append("\n\n".join(buf)); buf = []
+    if buf: out.append("\n\n".join(buf))
+    return out
 
-def looks_foreign(title):
-    return bool(re.search(r"[A-Za-z]", title or ""))
-
-def ok_by_rules(title):
-    # ایرانی‌ها همیشه اوکی؛ خارجی‌ها اگر در عنوان اشاره به دوبله/زیرنویس باشد
-    if is_fa(title) and not looks_foreign(title):
-        return True
-    if any(k in (title or "") for k in ["دوبله", "زیرنویس", "Dub", "Sub"]):
-        return True
-    # اگر انگلیسی خالی بود، احتمالا لینک خبر یا … پس رد
-    return not looks_foreign(title)
-
-def format_item(source, title, link, extra=None):
-    y = guess_year(title, link)
-    q = guess_quality(title, extra or "")
-    badge = "📺 سریال" if any(w in (title or "") for w in ["سریال","قسمت","فصل"]) else "🎬 فیلم"
+def format_item(platform, title, link, extra_txt=""):
+    year = guess_year(title + " " + extra_txt)
+    genre = maybe_genre(title + " " + extra_txt)
+    badge = "📺 سریال" if any(w in title for w in ["سریال","Season","قسمت","فصل"]) else "🎬 فیلم"
     return (
         f"{badge}\n"
         f"📝 نام: {title}\n"
-        f"📅 سال: {y}\n"
-        f"🎯 کیفیت: {q}\n"
+        f"📅 سال: {year}\n"
+        f"🎭 ژانر: {genre}\n"
         f"🔗 {link}\n"
-        f"↘️ منبع: {source}"
+        f"↘️ منبع: {platform}"
     )
 
-# ---------- دریافت صفحه ----------
-def fetch(url):
-    try:
-        r = requests.get(url, headers=HDR, timeout=REQ_TIMEOUT)
-        r.raise_for_status()
-        return r.text
-    except Exception as e:
-        print("fetch error:", url, e)
-        return ""
-
-# ---------- استخراج عمومی ----------
-def extract_generic(url, limit=60):
+# ---------- Scrapers (legal & public) ----------
+def filimo_latest(limit=30):
+    base = "https://www.filimo.com"
+    url  = base + "/newest"
     html = fetch(url)
     if not html: return []
     soup = BeautifulSoup(html, "html.parser")
-    items = []
+    out = []
+    cards = soup.select("a[href^='/m/'], a[href^='/s/'], div a[href*='/m/'], div a[href*='/s/']")
+    if not cards: cards = soup.find_all("a", href=True)
 
-    # لینک‌های پرتکرار با عنوان
-    for a in soup.find_all("a", href=True, limit=600):
-        text = a.get_text(separator=" ", strip=True)
+    for a in cards:
+        href  = a.get("href") or ""
+        if not any(p in href for p in ["/m/","/s/"]): continue
+        title = (a.get("title") or a.get_text(" ", strip=True) or "").strip()
+        if len(title) < 2: continue
+        out.append(("فیلیمو", title, abs_url(base, href)))
+        if len(out) >= limit: break
+
+    # unique by link
+    seen, uniq = set(), []
+    for item in out:
+        if item[2] in seen: continue
+        seen.add(item[2]); uniq.append(item)
+    return uniq[:limit]
+
+def namava_latest(limit=30):
+    base = "https://www.namava.ir"
+    urls = [base + "/movies", base + "/series", base + "/recently-added"]
+    out = []
+    for url in urls:
+        html = fetch(url)
+        if not html: continue
+        soup = BeautifulSoup(html, "html.parser")
+        cards = soup.select("a[href^='/movie/'], a[href^='/series/'], a[href*='/content/']")
+        if not cards: cards = soup.find_all("a", href=True)
+        for a in cards:
+            href = a.get("href") or ""
+            if not any(x in href for x in ["/movie/","/series/","/content/"]): continue
+            title = (a.get("title") or a.get_text(" ", strip=True) or "").strip()
+            if len(title) < 2: continue
+            out.append(("نماوا", title, abs_url(base, href)))
+            if len(out) >= limit: break
+        if len(out) >= limit: break
+    # unique
+    seen, uniq = set(), []
+    for item in out:
+        if item[2] in seen: continue
+        seen.add(item[2]); uniq.append(item)
+    return uniq[:limit]
+
+def filmnet_latest(limit=30):
+    base = "https://filmnet.ir"
+    urls = [base + "/movies", base + "/series"]
+    out = []
+    for url in urls:
+        html = fetch(url)
+        if not html: continue
+        soup = BeautifulSoup(html, "html.parser")
+        cards = soup.select("a[href^='/title/'], a[href^='/movies/'], a[href^='/series/']")
+        if not cards: cards = soup.find_all("a", href=True)
+        for a in cards:
+            href = a.get("href") or ""
+            if not any(x in href for x in ["/title/","/movies/","/series/"]): continue
+            title = (a.get("title") or a.get_text(" ", strip=True) or "").strip()
+            if len(title) < 2: continue
+            out.append(("فیلم‌نت", title, abs_url(base, href)))
+            if len(out) >= limit: break
+        if len(out) >= limit: break
+    # unique
+    seen, uniq = set(), []
+    for item in out:
+        if item[2] in seen: continue
+        seen.add(item[2]); uniq.append(item)
+    return uniq[:limit]
+
+def salamsinema_latest(limit=30):
+    # اطلاع‌رسانی فیلم‌ها/خبرهای جدید (بدون دانلود)
+    base = "https://www.salamcinama.ir"
+    url  = base + "/news"
+    html = fetch(url)
+    if not html: return []
+    soup = BeautifulSoup(html, "html.parser")
+    out = []
+    for a in soup.find_all("a", href=True):
         href = a["href"]
-        if not text or len(text) < 2: continue
-        # فیلتر لینک‌های ناوبری/بی‌ربط
-        if any(bad in href for bad in ["#","javascript:","/tag/","/page/","/category/","/author/"]): 
-            continue
-        full = abs_url(url, href)
-        # یک حداقل: متن باید شبیه عنوان محتوا باشد (فارسی یا شامل year/quality)
-        if is_fa(text) or re.search(r"(19|20)\d{2}", text) or any(q.lower() in text.lower() for q in QUALITY_HINTS):
-            items.append((text, full))
+        if not href or "/news/" not in href: continue
+        title = a.get("title") or a.get_text(" ", strip=True)
+        if not title or len(title) < 4: continue
+        out.append(("سلام‌سینما", title.strip(), abs_url(base, href)))
+        if len(out) >= limit: break
+    # unique
+    seen, uniq = set(), []
+    for item in out:
+        if item[2] in seen: continue
+        seen.add(item[2]); uniq.append(item)
+    return uniq[:limit]
 
-    # یکتا و کوتاه
-    uniq, seen = [], set()
-    for t, l in items:
-        if (t, l) in seen: continue
-        seen.add((t,l)); uniq.append((t,l))
+def cinematicket_coming(limit=30):
+    base = "https://www.cinematicket.org"
+    url  = base + "/movies/comingsoon"
+    html = fetch(url)
+    if not html:
+        # fallback صفحه اصلی
+        html = fetch(base)
+        if not html: return []
+    soup = BeautifulSoup(html, "html.parser")
+    out = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not href or ("movie" not in href and "movies" not in href): continue
+        title = a.get("title") or a.get_text(" ", strip=True)
+        if not title or len(title) < 2: continue
+        out.append(("سینماتیکت", title.strip(), abs_url(base, href)))
+        if len(out) >= limit: break
+    # unique
+    seen, uniq = set(), []
+    for item in out:
+        if item[2] in seen: continue
+        seen.add(item[2]); uniq.append(item)
+    return uniq[:limit]
+
+# Aggregators
+def latest_movies(limit=30):
+    bag = []
+    bag += filimo_latest(20)
+    bag += namava_latest(20)
+    bag += filmnet_latest(20)
+    # در منابع بالا فیلم/سریال قاطی می‌آید؛ بعداً با badge مشخص می‌کنیم
+    random.shuffle(bag)
+    # unique by link
+    seen, uniq = set(), []
+    for item in bag:
+        if item[2] in seen: continue
+        seen.add(item[2]); uniq.append(item)
         if len(uniq) >= limit: break
     return uniq
 
-# ---------- استخراج ویژه چند سایت ----------
-def extract_hexdownload(url):
-    html = fetch(url); 
-    if not html: return []
-    soup = BeautifulSoup(html, "html.parser")
-    out = []
-    # کارت‌ها
-    for art in soup.select("article, div.post, div.grid-item")[:80]:
-        a = art.find("a", href=True)
-        if not a: continue
-        title = a.get("title") or a.get_text(strip=True)
-        link  = abs_url(url, a["href"])
-        if title: out.append((title, link))
-    if not out:
-        out = extract_generic(url, 40)
-    return out
+def latest_series(limit=30):
+    # همان منابع؛ فیلتر بر اساس کلمات سریالی
+    items = latest_movies(80)
+    series = []
+    for plat, title, link in items:
+        if any(w in title for w in ["سریال","قسمت","Season","فصل"]):
+            series.append((plat,title,link))
+        if len(series) >= limit: break
+    return series
 
-def extract_uptvs(url):
-    html = fetch(url)
-    if not html: return []
-    soup = BeautifulSoup(html, "html.parser")
-    out = []
-    for art in soup.select("article.post, div.post")[:80]:
-        a = art.find("a", href=True)
-        if not a: continue
-        title = a.get("title") or a.get_text(strip=True)
-        link  = abs_url(url, a["href"])
-        if title: out.append((title, link))
-    if not out:
-        out = extract_generic(url, 40)
-    return out
-
-def extract_film2movie(url):
-    html = fetch(url)
-    if not html: return []
-    soup = BeautifulSoup(html, "html.parser")
-    out = []
-    for art in soup.select("article, div.post")[:80]:
-        a = art.find("a", href=True)
-        if not a: continue
-        title = a.get("title") or a.get_text(strip=True)
-        link  = abs_url(url, a["href"])
-        if title: out.append((title, link))
-    if not out:
-        out = extract_generic(url, 40)
-    return out
-
-SPECIAL_EXTRACTORS = {
-    "hexdownload": extract_hexdownload,
-    "uptvs": extract_uptvs,
-    "film2movie": extract_film2movie,
-}
-
-def extract_from_source(src_name, url):
-    fn = SPECIAL_EXTRACTORS.get(src_name, None)
-    try:
-        pairs = fn(url) if fn else extract_generic(url, 50)
-    except Exception as e:
-        print("extractor error:", src_name, url, e)
-        pairs = []
-    # فیلتر قواعد
-    clean = []
-    seen = set()
-    for title, link in pairs:
-        if not link or not title: continue
-        if (title, link) in seen: continue
-        seen.add((title, link))
-        if ok_by_rules(title):
-            clean.append((title, link))
-    return clean[:20]
-
-# ---------- گردآوری ----------
-def collect_quick(kind=None):
-    bag = []
-    for (name, url, k) in QUICK_SOURCES:
-        if kind and k != kind: 
-            continue
-        bag.extend([(name,)+x for x in extract_from_source(name, url)])
-    # یکتا بر اساس لینک
-    uniq, seen = [], set()
+def archive_last3days(limit=40):
+    # چون تاریخ دقیق در HTML همه‌ی منابع نیست، از آخرین موارد صفحه‌ها استفاده می‌کنیم
+    bag = filimo_latest(20) + namava_latest(20) + filmnet_latest(20) + salamsinema_latest(12) + cinematicket_coming(12)
     random.shuffle(bag)
-    for s, t, l in bag:
-        if l in seen: continue
-        seen.add(l); uniq.append((s,t,l))
-        if len(uniq) >= 30: break
+    # unique
+    seen, uniq = set(), []
+    for item in bag:
+        if item[2] in seen: continue
+        seen.add(item[2]); uniq.append(item)
+        if len(uniq) >= limit: break
     return uniq
 
-def collect_extended(query=None):
-    bag = []
-    for (name, url, _k) in EXTENDED_SOURCES:
-        pairs = extract_from_source(name, url)
-        if query:
-            q = query.strip().lower()
-            pairs = [(t,l) for (t,l) in pairs if q in t.lower()]
-        bag.extend([(name,)+x for x in pairs])
-        time.sleep(0.2)
-    uniq, seen = [], set()
-    for s, t, l in bag:
-        if l in seen: continue
-        seen.add(l); uniq.append((s,t,l))
-        if len(uniq) >= 40: break
-    return uniq
+def search_all(q, by_year=False, limit=40):
+    ql = (q or "").strip().lower()
+    bag = filimo_latest(60) + namava_latest(60) + filmnet_latest(60) + salamsinema_latest(40) + cinematicket_coming(40)
+    res = []
+    for plat, title, link in bag:
+        hay = title.lower()
+        if by_year:
+            y = guess_year(title)
+            if y != "-" and ql in y.lower():
+                res.append((plat,title,link))
+        else:
+            if ql in hay:
+                res.append((plat,title,link))
+        if len(res) >= limit: break
+    return res
 
-def collect_last_days(days=3):
-    # چون تاریخ دقیق همیشه در HTML نیست، به‌جای تاریخ، از «آخرین آیتم‌های صفحه» استفاده می‌کنیم
-    # و فرض می‌گیریم بالای لیست جدیدتره. جمعاً حدود 15-20 آیتم از هر منبع.
-    bag = []
-    for (name, url, _k) in QUICK_SOURCES:
-        pairs = extract_from_source(name, url)[:15]
-        bag.extend([(name,)+x for x in pairs])
-    uniq, seen = [], set()
-    for s, t, l in bag:
-        if l in seen: continue
-        seen.add(l); uniq.append((s,t,l))
-    return uniq[:60]
-
-# ---------- تلگرام UI ----------
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
+# ---------- Telegram UI ----------
+MAIN_KEYS = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("🎬 فیلم ایرانی"), KeyboardButton("📺 سریال ایرانی")],
-        [KeyboardButton("🌍 فیلم خارجی"), KeyboardButton("🌍 سریال خارجی")],
-        [KeyboardButton("📅 آرشیو ۳ روز"), KeyboardButton("🔍 جستجوی نام")],
-        [KeyboardButton("🔎 جستجوی گسترده"), KeyboardButton("📩 تماس با من")],
+        [KeyboardButton("🎥 فیلم‌های جدید"), KeyboardButton("📺 سریال‌های جدید")],
+        [KeyboardButton("🔍 جستجو (نام)"), KeyboardButton("📅 جستجو (سال)")],
+        [KeyboardButton("🗂 آرشیو ۳ روز اخیر"), KeyboardButton("📩 تماس با من")],
     ],
     resize_keyboard=True
 )
+CONTACT_INLINE = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("ارتباط در تلگرام", url=f"https://t.me/{CONTACT_USER}")]]
+)
 
-CONTACT_INLINE = InlineKeyboardMarkup([
-    [InlineKeyboardButton("ارتباط در تلگرام", url=f"https://t.me/{CONTACT_USER}")]
-])
+def cmd_start(update: Update, context: CallbackContext):
+    update.message.reply_text("✅ ربات فعاله. از منوی پایین انتخاب کن:", reply_markup=MAIN_KEYS)
 
-async def send_menu(chat_id, context: ContextTypes.DEFAULT_TYPE, text="یکی از گزینه‌ها رو انتخاب کن:"):
-    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=MAIN_KEYBOARD)
+def cmd_help(update: Update, context: CallbackContext):
+    update.message.reply_text("از دکمه‌ها استفاده کن یا /start رو بزن.", reply_markup=MAIN_KEYS)
 
-def send_chunked(context, chat_id, items, prefix=None):
-    # ارسال نتایج در چند پیام کوتاه تا محدودیت تلگرام رعایت شود
-    count = 0
-    block = []
-    for (src, title, link) in items:
-        msg = format_item(src, title, link)
-        block.append(msg); count += 1
-        if len("\n\n".join(block)) > 3500 or count % 6 == 0:
-            context.bot.send_message(chat_id=chat_id, text=(prefix+"\n" if prefix else "") + "\n\n".join(block))
-            block = []
-            time.sleep(0.2)
-    if block:
-        context.bot.send_message(chat_id=chat_id, text=(prefix+"\n" if prefix else "") + "\n\n".join(block))
-
-# ---------- هندلرها ----------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ ربات فعاله.", reply_markup=MAIN_KEYBOARD)
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("از منوی پایین انتخاب کن یا /start رو بزن.", reply_markup=MAIN_KEYBOARD)
-
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def on_text(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
 
     if text == "📩 تماس با من":
-        await context.bot.send_message(chat_id=chat_id, text="برای ارتباط:", reply_markup=CONTACT_INLINE)
+        context.bot.send_message(chat_id=chat_id, text="برای ارتباط:", reply_markup=CONTACT_INLINE)
         return
 
-    if text == "🎬 فیلم ایرانی":
-        await update.message.reply_text("⏳ در حال دریافت فیلم‌های ایرانی جدید از منابع سریع ...")
-        items = collect_quick(kind="movie")
-        items = [i for i in items if is_fa(i[1])] or items  # ترجیح عنوان فارسی
+    if text == "🎥 فیلم‌های جدید":
+        update.message.reply_text("⏳ در حال دریافت جدیدترین‌ها از منابع رسمی ...")
+        items = latest_movies(24)
         if not items:
-            await update.message.reply_text("نتیجه‌ای پیدا نشد.")
+            update.message.reply_text("❌ نتیجه‌ای پیدا نشد.")
         else:
-            send_chunked(context, chat_id, items[:20], "🎬 فیلم‌های ایرانی جدید:")
+            blocks = [format_item(*it, "") for it in items]
+            for chunk in split_blocks(blocks):
+                context.bot.send_message(chat_id=chat_id, text=chunk)
+        return
 
-    elif text == "📺 سریال ایرانی":
-        await update.message.reply_text("⏳ در حال دریافت سریال‌های ایرانی جدید ...")
-        items = collect_quick(kind="series")
-        items = [i for i in items if is_fa(i[1])] or items
+    if text == "📺 سریال‌های جدید":
+        update.message.reply_text("⏳ در حال دریافت سریال‌ها ...")
+        items = latest_series(24)
         if not items:
-            await update.message.reply_text("نتیجه‌ای پیدا نشد.")
+            update.message.reply_text("❌ نتیجه‌ای پیدا نشد.")
         else:
-            send_chunked(context, chat_id, items[:20], "📺 سریال‌های ایرانی جدید:")
+            blocks = [format_item(*it, "") for it in items]
+            for chunk in split_blocks(blocks):
+                context.bot.send_message(chat_id=chat_id, text=chunk)
+        return
 
-    elif text == "🌍 فیلم خارجی":
-        await update.message.reply_text("⏳ در حال دریافت فیلم‌های خارجی (با دوبله/زیرنویس) ...")
-        items = collect_quick(kind="movie")
-        # خارجی‌هایی که اشاره به دوبله/زیرنویس دارند
-        items = [i for i in items if any(k in i[1] or k in i[2] for k in ["دوبله","زیرنویس","Dub","Sub","Dual"])]
+    if text == "🗂 آرشیو ۳ روز اخیر":
+        update.message.reply_text("⏳ در حال گردآوری آرشیو ...")
+        items = archive_last3days(40)
         if not items:
-            await update.message.reply_text("نتیجه‌ای پیدا نشد.")
+            update.message.reply_text("❌ چیزی پیدا نشد.")
         else:
-            send_chunked(context, chat_id, items[:20], "🌍 فیلم‌های خارجی (Dub/Sub):")
+            blocks = [format_item(*it, "") for it in items]
+            for chunk in split_blocks(blocks):
+                context.bot.send_message(chat_id=chat_id, text=chunk)
+        return
 
-    elif text == "🌍 سریال خارجی":
-        await update.message.reply_text("⏳ در حال دریافت سریال‌های خارجی (با دوبله/زیرنویس) ...")
-        items = collect_quick(kind="series")
-        items = [i for i in items if any(k in i[1] or k in i[2] for k in ["دوبله","زیرنویس","Dub","Sub","Dual","قسمت","فصل"])]
+    if text == "🔍 جستجو (نام)":
+        context.user_data["mode"] = "name"
+        update.message.reply_text("نام فیلم/سریال را بفرست (فارسی یا انگلیسی).")
+        return
+
+    if text == "📅 جستجو (سال)":
+        context.user_data["mode"] = "year"
+        update.message.reply_text("سال ساخت را بفرست (مثلاً: 2023).")
+        return
+
+    # query handler
+    mode = context.user_data.get("mode")
+    if mode == "name" and len(text) >= 2:
+        update.message.reply_text("⏳ در حال جستجو بر اساس نام ...")
+        items = search_all(text, by_year=False, limit=30)
+        context.user_data["mode"] = None
         if not items:
-            await update.message.reply_text("نتیجه‌ای پیدا نشد.")
+            update.message.reply_text("چیزی پیدا نشد.")
         else:
-            send_chunked(context, chat_id, items[:20], "🌍 سریال‌های خارجی (Dub/Sub):")
-
-    elif text == "📅 آرشیو ۳ روز":
-        await update.message.reply_text("⏳ در حال گردآوری آرشیو سه روز اخیر (سریع) ...")
-        items = collect_last_days(3)
+            blocks = [format_item(*it, "") for it in items]
+            for chunk in split_blocks(blocks):
+                context.bot.send_message(chat_id=chat_id, text=chunk)
+        return
+    elif mode == "year" and re.fullmatch(r"\d{4}", text or ""):
+        update.message.reply_text("⏳ در حال جستجو بر اساس سال ...")
+        items = search_all(text, by_year=True, limit=30)
+        context.user_data["mode"] = None
         if not items:
-            await update.message.reply_text("چیزی پیدا نشد.")
+            update.message.reply_text("چیزی پیدا نشد.")
         else:
-            send_chunked(context, chat_id, items[:30], "🗂 آرشیو ۳ روز گذشته:")
-
-    elif text == "🔍 جستجوی نام":
-        await update.message.reply_text("نام فیلم/سریال رو بفرست (مثلاً: قورباغه یا Oppenheimer).")
-
-    elif text == "🔎 جستجوی گسترده":
-        await update.message.reply_text("نام رو بفرست تا در تمام منابع جستجو کنم.")
-        # پرچم مود گسترده
-        context.user_data["wide_search"] = True
-
+            blocks = [format_item(*it, "") for it in items]
+            for chunk in split_blocks(blocks):
+                context.bot.send_message(chat_id=chat_id, text=chunk)
+        return
     else:
-        # اگر کاربر نام فرستاد:
-        q = text.strip()
-        if len(q) >= 2:
-            await update.message.reply_text("⏳ در حال جستجو ...")
-            wide = context.user_data.pop("wide_search", False)
-            items = collect_extended(q) if wide else [
-                (s,t,l) for (s,t,l) in collect_quick() if q.lower() in t.lower()
-            ]
-            if not items:
-                await update.message.reply_text("نتیجه‌ای پیدا نشد.")
-            else:
-                send_chunked(context, chat_id, items[:25], "🔎 نتایج جستجو:")
-        else:
-            await update.message.reply_text("برای جستجو، حداقل دو کاراکتر بفرست.", reply_markup=MAIN_KEYBOARD)
+        update.message.reply_text("از منو استفاده کن یا /start رو بزن.", reply_markup=MAIN_KEYS)
 
-# ---------- زمان‌بندی خودکار ----------
-def scheduler_loop():
-    while True:
-        try:
-            # بررسی منابع سریع و ارسال موارد جدید (فقط لینک‌های جدید)
-            items = collect_quick()
-            sent = 0
-            for (src, title, link) in items:
-                if db_seen_has(link): continue
-                if not ok_by_rules(title): continue
-                msg = format_item(src, title, link)
-                try:
-                    requests.post(
-                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                        data={"chat_id": ADMIN_CHAT_ID, "text": msg}, timeout=15
-                    )
-                    db_seen_add(link, title); sent += 1
-                except Exception as e:
-                    print("send error:", e)
-                time.sleep(0.2)
-            if sent == 0:
-                print("scheduler: nothing new")
-        except Exception as e:
-            print("scheduler error:", e)
-        time.sleep(CHECK_INTERVAL_SECONDS)
+def error_handler(update: Update, context: CallbackContext):
+    log.warning(f"Update {update} caused error {context.error}")
 
-# ---------- Flask keep-alive ----------
+# ---------- Flask keep-alive (Render) ----------
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
 def root():
-    return "CineBot is running."
+    return "CineBot (legal) is running."
 
 @flask_app.route("/health")
 def health():
@@ -439,21 +371,38 @@ def run_flask():
     port = int(os.environ.get("PORT", "10000"))
     flask_app.run(host="0.0.0.0", port=port)
 
+# ---------- Optional notifier (send to admin) ----------
+def scheduler_loop(bot):
+    last_sent = set()
+    while True:
+        try:
+            bag = archive_last3days(20)
+            new_items = [(p,t,l) for (p,t,l) in bag if l not in last_sent]
+            for p,t,l in new_items:
+                bot.send_message(chat_id=ADMIN_CHAT_ID, text=format_item(p,t,l))
+                last_sent.add(l)
+                time.sleep(0.3)
+            if not new_items:
+                log.info("scheduler: nothing new")
+        except Exception as e:
+            log.warning(f"scheduler error: {e}")
+        time.sleep(CHECK_INTERVAL_SECONDS)
+
 # ---------- Main ----------
 def main():
-    db_init()
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler("start", cmd_start))
+    dp.add_handler(CommandHandler("help", cmd_help))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, on_text))
+    dp.add_error_handler(error_handler)
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
-    # وب‌سرور و زمان‌بند در ترد جدا
     threading.Thread(target=run_flask, daemon=True).start()
-    threading.Thread(target=scheduler_loop, daemon=True).start()
+    threading.Thread(target=scheduler_loop, args=(updater.bot,), daemon=True).start()
 
-    print("✅ CineBot ready. Send /start in Telegram.")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    log.info("CineBot (legal) running. Send /start in Telegram.")
+    updater.start_polling(drop_pending_updates=True)
+    updater.idle()
 
 if __name__ == "__main__":
     main()
