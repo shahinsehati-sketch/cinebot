@@ -1,6 +1,4 @@
-build-essential
-libxml2
 libxml2-dev
-libxslt1-dev
-zlib1g-dev
+libxslt-dev
 python3-dev
+gcc
