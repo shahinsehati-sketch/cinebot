@@ -1,86 +1,47 @@
 import logging
-import requests
-from bs4 import BeautifulSoup
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, MessageHandler, CallbackContext, Filters
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ------------------ تنظیمات ------------------
-TOKEN = "8153319362:AAGgeAOZyP2VgAdqvjyvvIkgGZBsJtTQOTs"
+# 🔑 توکن جدید رباتتو اینجا بذار
+BOT_TOKEN = "8153319362:AAGgeAOZyP2VgAdqvjyvvIkgGZBsJtTQOTs"
 
-SITES = {
-    "دوستی‌ها": "https://www.doostihaa.com/",
-    "UPTV": "https://www.uptvs.com/",
-    "HexDownload": "https://hexdownload.co/category/movie/",
-    "DigiMovie": "https://digimovie.vip/movies/",
-}
+logging.basicConfig(level=logging.INFO)
 
-# ------------------ لاگ ------------------
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# کیبورد (منو)
+main_menu = [
+    ["🎬 فیلم‌های جدید", "📺 سریال‌های جدید"],
+    ["📂 آرشیو ۳ روز اخیر", "📩 تماس با سازنده"]
+]
+reply_markup = ReplyKeyboardMarkup(main_menu, resize_keyboard=True)
 
-# ------------------ شروع ------------------
-def start(update: Update, context: CallbackContext) -> None:
-    keyboard = [
-        [InlineKeyboardButton("🆕 جدیدترین‌ها", callback_data="latest")],
-        [InlineKeyboardButton("📩 تماس با ادمین", url="https://t.me/shahin_sehati")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text("سلام! 🎥\nبه ربات فیلم خوش اومدی.", reply_markup=reply_markup)
+# دستور استارت
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "سلام 👋\nبه ربات فیلم و سریال خوش اومدی!",
+        reply_markup=reply_markup
+    )
 
-# ------------------ اسکرپ از سایت ------------------
-def scrape_latest():
-    results = []
-    for site, url in SITES.items():
-        try:
-            r = requests.get(url, timeout=10)
-            soup = BeautifulSoup(r.text, "html.parser")
-            # گرفتن چند تا عنوان اول
-            titles = [a.text.strip() for a in soup.find_all("a") if a.text and len(a.text) > 5][:5]
-            for t in titles:
-                results.append(f"{site}: {t}")
-        except Exception as e:
-            results.append(f"{site}: خطا در دریافت اطلاعات ❌")
-    return results
+# هندل دکمه‌ها
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
 
-def latest(update: Update, context: CallbackContext):
-    movies = scrape_latest()
-    if not movies:
-        update.message.reply_text("❌ چیزی پیدا نشد.")
-        return
-    msg = "📢 آخرین فیلم‌ها:\n\n" + "\n".join(movies)
-    update.message.reply_text(msg)
-
-# ------------------ جستجو ------------------
-def search(update: Update, context: CallbackContext):
-    query = update.message.text.strip()
-    results = []
-    for site, url in SITES.items():
-        try:
-            r = requests.get(url, timeout=10)
-            soup = BeautifulSoup(r.text, "html.parser")
-            matches = [a.text.strip() for a in soup.find_all("a") if query.lower() in a.text.lower()]
-            if matches:
-                results.append(f"🔎 {site}: " + ", ".join(matches[:3]))
-        except:
-            pass
-    if results:
-        update.message.reply_text("\n".join(results))
+    if text == "🎬 فیلم‌های جدید":
+        await update.message.reply_text("📌 لیست فیلم‌های جدید:\n- فیلم ۱\n- فیلم ۲\n- فیلم ۳")
+    elif text == "📺 سریال‌های جدید":
+        await update.message.reply_text("📌 لیست سریال‌های جدید:\n- سریال ۱\n- سریال ۲\n- سریال ۳")
+    elif text == "📂 آرشیو ۳ روز اخیر":
+        await update.message.reply_text("📂 آرشیو ۳ روز اخیر:\n- مورد A\n- مورد B\n- مورد C")
+    elif text == "📩 تماس با سازنده":
+        await update.message.reply_text("برای ارتباط با سازنده به آیدی زیر پیام بده:\n👉 @shahin_sehati")
     else:
-        update.message.reply_text("❌ نتیجه‌ای پیدا نشد.")
+        await update.message.reply_text("لطفاً از منو انتخاب کن 👇", reply_markup=reply_markup)
 
-# ------------------ اصلی ------------------
+# راه‌اندازی
 def main():
-    updater = Updater(TOKEN)
-    dispatcher = updater.dispatcher
-
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(CommandHandler("latest", latest))
-    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, search))
-
-    updater.start_polling()
-    updater.idle()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.run_polling()
 
 if __name__ == "__main__":
-    main()        
+    main()     
