@@ -1,3 +1,5 @@
 #!/bin/bash
 set -e
-python3 main.py
+
+echo "Starting CryptoWatcherBot..."
+python main.py
