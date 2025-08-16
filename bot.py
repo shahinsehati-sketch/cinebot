@@ -1,47 +1,132 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+CryptoWatcherBot — نسخه نهایی
+------------------------------
+- هر ۵ دقیقه
+- ۱۵ ارز برتر
+- توکن و chat_id مستقیم داخل کد
+"""
+from __future__ import annotations
+import asyncio
 import logging
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from typing import Dict, List
 
-# 🔑 توکن جدید رباتتو اینجا بذار
+import requests
+from telegram.constants import ParseMode
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, JobQueue
+
+# --------------- Config & Logging ---------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("CryptoWatcherBot")
+
+# ⚠️ این مقادیر ثابت شده‌اند
 BOT_TOKEN = "8153319362:AAGgeAOZyP2VgAdqvjyvvIkgGZBsJtTQOTs"
+DEFAULT_CHAT_ID = "821239377"
+PUSH_EVERY_MIN = 5
+MANUAL_TOMAN_RATE = 0
 
-logging.basicConfig(level=logging.INFO)
+# --------------- Data Fetchers ---------------
+COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
+FX_URL = "https://api.exchangerate.host/latest?base=USD&symbols=IRR"
+HEADERS = {"User-Agent": "CryptoWatcherBot/1.0"}
 
-# کیبورد (منو)
-main_menu = [
-    ["🎬 فیلم‌های جدید", "📺 سریال‌های جدید"],
-    ["📂 آرشیو ۳ روز اخیر", "📩 تماس با سازنده"]
-]
-reply_markup = ReplyKeyboardMarkup(main_menu, resize_keyboard=True)
+def fetch_top() -> List[Dict]:
+    params = {
+        "vs_currency": "usd",
+        "order": "market_cap_desc",
+        "per_page": 15,
+        "page": 1,
+        "price_change_percentage": "24h",
+        "locale": "en",
+    }
+    r = requests.get(COINGECKO_URL, params=params, timeout=20, headers=HEADERS)
+    r.raise_for_status()
+    data: List[Dict] = r.json()
+    neat = []
+    for d in data:
+        neat.append(
+            {
+                "symbol": (d.get("symbol") or "").upper(),
+                "name": d.get("name") or "",
+                "price_usd": float(d.get("current_price") or 0.0),
+                "change_24h": float(d.get("price_change_percentage_24h") or 0.0),
+            }
+        )
+    return neat
 
-# دستور استارت
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "سلام 👋\nبه ربات فیلم و سریال خوش اومدی!",
-        reply_markup=reply_markup
-    )
+def fetch_usd_to_toman() -> float:
+    if MANUAL_TOMAN_RATE > 0:
+        return MANUAL_TOMAN_RATE
+    r = requests.get(FX_URL, timeout=15, headers=HEADERS)
+    r.raise_for_status()
+    js = r.json() or {}
+    irr = float(js.get("rates", {}).get("IRR") or 0)
+    if irr <= 0:
+        raise RuntimeError("Invalid IRR rate")
+    return irr / 10.0
 
-# هندل دکمه‌ها
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+# --------------- Formatting ---------------
+def fmt_num(n: float, digits: int = 2) -> str:
+    return f"{n:,.{digits}f}".replace(",", "_").replace("_", ",")
 
-    if text == "🎬 فیلم‌های جدید":
-        await update.message.reply_text("📌 لیست فیلم‌های جدید:\n- فیلم ۱\n- فیلم ۲\n- فیلم ۳")
-    elif text == "📺 سریال‌های جدید":
-        await update.message.reply_text("📌 لیست سریال‌های جدید:\n- سریال ۱\n- سریال ۲\n- سریال ۳")
-    elif text == "📂 آرشیو ۳ روز اخیر":
-        await update.message.reply_text("📂 آرشیو ۳ روز اخیر:\n- مورد A\n- مورد B\n- مورد C")
-    elif text == "📩 تماس با سازنده":
-        await update.message.reply_text("برای ارتباط با سازنده به آیدی زیر پیام بده:\n👉 @shahin_sehati")
-    else:
-        await update.message.reply_text("لطفاً از منو انتخاب کن 👇", reply_markup=reply_markup)
+def render_message(rows: List[Dict], usd_to_toman: float) -> str:
+    lines = []
+    lines.append("Top 15 by Market Cap — Every 5 minutes\n")
+    lines.append(f"USD→Toman ≈ {fmt_num(usd_to_toman, 0)} تومان\n")
+    lines.append("```)\n")
+    lines.append(f"{'#':>2}  {'Coin':8}  {'USD':>14}  {'Toman':>16}  {'24h%':>7}")
+    lines.append("-" * 56)
+    for i, r in enumerate(rows, 1):
+        usd = r["price_usd"]
+        toman = usd * usd_to_toman
+        pct = r["change_24h"]
+        coin = (r["symbol"] or "?")[:8].ljust(8)
+        lines.append(
+            f"{i:>2}  {coin}  {fmt_num(usd, 2):>14}  {fmt_num(toman, 0):>16}  {pct:+6.2f}"
+        )
+    lines.append("```")
+    lines.append("\nData: CoinGecko • FX: exchangerate.host")
+    return "\n".join(lines)
 
-# راه‌اندازی
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling()
+# --------------- Bot Handlers ---------------
+async def now(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        rows = fetch_top()
+        usd_to_toman = fetch_usd_to_toman()
+        text = render_message(rows, usd_to_toman)
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+    except Exception as e:
+        logger.exception("/now failed")
+        await update.message.reply_text(f"خطا: {e}")
+
+async def _send_once(app: Application, chat_id: int) -> None:
+    try:
+        rows = fetch_top()
+        usd_to_toman = fetch_usd_to_toman()
+        text = render_message(rows, usd_to_toman)
+        await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN_V2)
+    except Exception as e:
+        logger.exception("push failed")
+
+async def periodic_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    app: Application = context.application
+    if DEFAULT_CHAT_ID and DEFAULT_CHAT_ID.isdigit():
+        await _send_once(app, int(DEFAULT_CHAT_ID))
+
+async def main() -> None:
+    application: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("now", now))
+    job_queue: JobQueue = application.job_queue
+    job_queue.run_repeating(periodic_job, interval=PUSH_EVERY_MIN * 60, first=5)
+    logger.info("Bot is up. Sending to CHAT_ID=%s every %d min", DEFAULT_CHAT_ID, PUSH_EVERY_MIN)
+    await application.run_polling()
 
 if __name__ == "__main__":
-    main()     
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Shutting down…")
