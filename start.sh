@@ -1,5 +1,5 @@
 #!/bin/bash
 set -e
 
-echo "Starting CryptoWatcherBot..."
+echo "Starting CryptoBot with Aiogram..."
 python main.py
