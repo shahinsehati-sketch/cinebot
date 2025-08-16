@@ -7,9 +7,15 @@ from typing import Dict, List
 
 import requests
 from telegram.constants import ParseMode
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    JobQueue,
+)
 
-# تنظیمات
+# ---------------- تنظیمات ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -25,7 +31,8 @@ COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
 FX_URL = "https://api.exchangerate.host/latest?base=USD&symbols=IRR"
 HEADERS = {"User-Agent": "CryptoWatcherBot/1.0"}
 
-# گرفتن داده‌ها
+
+# ---------------- گرفتن داده‌ها ----------------
 def fetch_top() -> List[Dict]:
     params = {
         "vs_currency": "usd",
@@ -49,6 +56,7 @@ def fetch_top() -> List[Dict]:
         )
     return neat
 
+
 def fetch_usd_to_toman() -> float:
     if MANUAL_TOMAN_RATE > 0:
         return MANUAL_TOMAN_RATE
@@ -60,9 +68,11 @@ def fetch_usd_to_toman() -> float:
         raise RuntimeError("Invalid IRR rate")
     return irr / 10.0
 
-# فرمت‌بندی
+
+# ---------------- فرمت‌بندی ----------------
 def fmt_num(n: float, digits: int = 2) -> str:
     return f"{n:,.{digits}f}".replace(",", "_").replace("_", ",")
+
 
 def render_message(rows: List[Dict], usd_to_toman: float) -> str:
     lines = []
@@ -83,7 +93,8 @@ def render_message(rows: List[Dict], usd_to_toman: float) -> str:
     lines.append("\nData: CoinGecko • FX: exchangerate.host")
     return "\n".join(lines)
 
-# هندلرها
+
+# ---------------- هندلرها ----------------
 async def now(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         rows = fetch_top()
@@ -94,28 +105,43 @@ async def now(update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("/now failed")
         await update.message.reply_text(f"خطا: {e}")
 
+
 async def _send_once(app: Application, chat_id: int) -> None:
     try:
         rows = fetch_top()
         usd_to_toman = fetch_usd_to_toman()
         text = render_message(rows, usd_to_toman)
-        await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN_V2)
+        await app.bot.send_message(
+            chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN_V2
+        )
     except Exception as e:
         logger.exception("push failed")
+
 
 async def periodic_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     app: Application = context.application
     if DEFAULT_CHAT_ID and DEFAULT_CHAT_ID.isdigit():
         await _send_once(app, int(DEFAULT_CHAT_ID))
 
-# اجرای اصلی
+
+# ---------------- اجرای اصلی ----------------
 async def main() -> None:
     application: Application = ApplicationBuilder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("now", now))
-    application.job_queue.run_repeating(periodic_job, interval=PUSH_EVERY_MIN * 60, first=5)
+
+    # --- رفع خطای job_queue=None ---
+    if application.job_queue is None:
+        application.job_queue = JobQueue()
+        application.job_queue.set_application(application)
+        application.job_queue.start()
+
+    application.job_queue.run_repeating(
+        periodic_job, interval=PUSH_EVERY_MIN * 60, first=5
+    )
 
     logger.info("Bot is running…")
     await application.run_polling()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
