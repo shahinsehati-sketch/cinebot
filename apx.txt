@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# ست‌کردن ورژن پایتون
+PYTHON_VERSION=3.11.9
+
+# نصب وابستگی‌ها
+pip install -r requirements.txt
+
+# اجرای ربات
+python main.py
