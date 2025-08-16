@@ -1,26 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import asyncio
 import logging
-from typing import Dict, List
-
 import requests
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    JobQueue,
-)
+from telegram import ParseMode
+from telegram.ext import Updater, CommandHandler
+import time
 
 # ---------------- تنظیمات ----------------
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
-logger = logging.getLogger("CryptoWatcherBot")
+logger = logging.getLogger(__name__)
 
 BOT_TOKEN = "8153319362:AAGgeAOZyP2VgAdqvjyvvIkgGZBsJtTQOTs"
 DEFAULT_CHAT_ID = "821239377"
@@ -33,7 +25,7 @@ HEADERS = {"User-Agent": "CryptoWatcherBot/1.0"}
 
 
 # ---------------- گرفتن داده‌ها ----------------
-def fetch_top() -> List[Dict]:
+def fetch_top():
     params = {
         "vs_currency": "usd",
         "order": "market_cap_desc",
@@ -43,7 +35,7 @@ def fetch_top() -> List[Dict]:
     }
     r = requests.get(COINGECKO_URL, params=params, timeout=20, headers=HEADERS)
     r.raise_for_status()
-    data: List[Dict] = r.json()
+    data = r.json()
     neat = []
     for d in data:
         neat.append(
@@ -57,7 +49,7 @@ def fetch_top() -> List[Dict]:
     return neat
 
 
-def fetch_usd_to_toman() -> float:
+def fetch_usd_to_toman():
     if MANUAL_TOMAN_RATE > 0:
         return MANUAL_TOMAN_RATE
     r = requests.get(FX_URL, timeout=15, headers=HEADERS)
@@ -70,11 +62,11 @@ def fetch_usd_to_toman() -> float:
 
 
 # ---------------- فرمت‌بندی ----------------
-def fmt_num(n: float, digits: int = 2) -> str:
+def fmt_num(n, digits=2):
     return f"{n:,.{digits}f}".replace(",", "_").replace("_", ",")
 
 
-def render_message(rows: List[Dict], usd_to_toman: float) -> str:
+def render_message(rows, usd_to_toman):
     lines = []
     lines.append("Top 15 by Market Cap — Every 5 minutes\n")
     lines.append(f"USD→Toman ≈ {fmt_num(usd_to_toman, 0)} تومان\n")
@@ -95,53 +87,46 @@ def render_message(rows: List[Dict], usd_to_toman: float) -> str:
 
 
 # ---------------- هندلرها ----------------
-async def now(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def now(update, context):
     try:
         rows = fetch_top()
         usd_to_toman = fetch_usd_to_toman()
         text = render_message(rows, usd_to_toman)
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+        update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
     except Exception as e:
         logger.exception("/now failed")
-        await update.message.reply_text(f"خطا: {e}")
+        update.message.reply_text(f"خطا: {e}")
 
 
-async def _send_once(app: Application, chat_id: int) -> None:
+def periodic_job(context):
     try:
         rows = fetch_top()
         usd_to_toman = fetch_usd_to_toman()
         text = render_message(rows, usd_to_toman)
-        await app.bot.send_message(
-            chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN_V2
+        context.bot.send_message(
+            chat_id=DEFAULT_CHAT_ID,
+            text=text,
+            parse_mode=ParseMode.MARKDOWN_V2
         )
     except Exception as e:
         logger.exception("push failed")
 
 
-async def periodic_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    app: Application = context.application
-    if DEFAULT_CHAT_ID and DEFAULT_CHAT_ID.isdigit():
-        await _send_once(app, int(DEFAULT_CHAT_ID))
-
-
 # ---------------- اجرای اصلی ----------------
-async def main() -> None:
-    application: Application = ApplicationBuilder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("now", now))
+def main():
+    updater = Updater(token=BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-    # --- رفع خطای job_queue=None ---
-    if application.job_queue is None:
-        application.job_queue = JobQueue()
-        application.job_queue.set_application(application)
-        application.job_queue.start()
+    dp.add_handler(CommandHandler("now", now))
 
-    application.job_queue.run_repeating(
-        periodic_job, interval=PUSH_EVERY_MIN * 60, first=5
-    )
+    # کار زمان‌بندی شده
+    jq = updater.job_queue
+    jq.run_repeating(periodic_job, interval=PUSH_EVERY_MIN * 60, first=5)
 
     logger.info("Bot is running…")
-    await application.run_polling()
+    updater.start_polling()
+    updater.idle()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
